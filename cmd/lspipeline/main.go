@@ -6,20 +6,21 @@ import (
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/codepipeline"
 	"github.com/aws/aws-sdk-go/service/codepipeline/codepipelineiface"
-	"github.com/gdamore/tcell/v2"
-	"github.com/mattn/go-runewidth"
+	"github.com/rivo/tview"
 	"os"
 	"strings"
 	"time"
 )
 
 type lspipeline struct {
-	client codepipelineiface.CodePipelineAPI
-	s tcell.Screen
+	*tview.Application
+	flex *tview.Flex
+
+	pipeline codepipelineiface.CodePipelineAPI
 }
 
 const dateFormat = "15:04:05 02-01-2006 PT"
-const refreshPeriod = 2 // seconds
+const refreshPeriod = 2*time.Second
 
 func NewLsPipeline() *lspipeline {
 	s, err := session.NewSession()
@@ -27,24 +28,11 @@ func NewLsPipeline() *lspipeline {
 		panic(err)
 	}
 	c := codepipeline.New(s)
-	return &lspipeline{c, nil}
-}
-
-func (app *lspipeline) initScreen() {
-	if app.s == nil {
-		var err error
-		app.s, err = tcell.NewScreen()
-		if err != nil {
-			panic(err)
-		}
-		if err = app.s.Init(); err != nil {
-			panic(err)
-		}
-	}
+	return &lspipeline{tview.NewApplication(), nil, c}
 }
 
 func (app *lspipeline) pipelineNames() (pipelineNames []string) {
-	err := app.client.ListPipelinesPages(
+	err := app.pipeline.ListPipelinesPages(
 		new(codepipeline.ListPipelinesInput),
 		func(output *codepipeline.ListPipelinesOutput, lastPage bool) (getNext bool) {
 			for _, summary := range output.Pipelines {
@@ -58,104 +46,96 @@ func (app *lspipeline) pipelineNames() (pipelineNames []string) {
 	return
 }
 
+func (app *lspipeline) renderPipeline(pipelineName string) {
+	for range time.Tick(refreshPeriod) {
+		pipelineState, err := app.pipeline.GetPipelineState(&codepipeline.GetPipelineStateInput{
+			Name: aws.String(pipelineName),
+		})
+		if err != nil {
+			panic(err)
+		}
+
+		app.QueueUpdateDraw(func() {
+			app.flex.Clear()
+
+			now := time.Now()
+
+			for _, state := range pipelineState.StageStates {
+				app.renderPipelineStage(&now, state)
+			}
+		})
+	}
+}
+
+func (app *lspipeline) renderPipelineActionState(rowFlex *tview.Flex, now *time.Time, state *codepipeline.ActionState) {
+	view := tview.NewTextView().SetDynamicColors(true).SetTextAlign(tview.AlignCenter).SetWrap(true).SetWordWrap(true)
+	view.SetTitle(*state.ActionName).SetBorder(true)
+	rowFlex.AddItem(view, 0, 1, false)
+
+	_, _, width, _ := view.GetInnerRect()
+	compact := width < 30
+
+	var text strings.Builder
+	text.WriteString("Last Status Change: ")
+	if compact {
+		text.WriteString("\n")
+	}
+	text.WriteString(prettyPrintTime(now, state.LatestExecution.LastStatusChange))
+	text.WriteString("\n")
+	text.WriteString("Status: ")
+	text.WriteString(prettyPrintStatus(state.LatestExecution.Status))
+
+	_, err := view.Write([]byte(text.String()))
+	if err != nil {
+		panic(err)
+	}
+}
+
+func (app *lspipeline) renderPipelineStage(now *time.Time, state *codepipeline.StageState) {
+	rowFlex := tview.NewFlex()
+
+	for _, state := range state.ActionStates {
+		app.renderPipelineActionState(rowFlex, now, state)
+	}
+
+	app.flex.AddItem(rowFlex, 0, 1, false)
+}
+
 func (app *lspipeline) printPipelineNames() {
 	for _, name := range app.pipelineNames() {
 		fmt.Println(name)
 	}
 }
 
-var statusColors = map[string]tcell.Color{
-	codepipeline.StageExecutionStatusSucceeded: tcell.ColorGreen,
-	codepipeline.StageExecutionStatusInProgress: tcell.ColorBlue,
-	codepipeline.StageExecutionStatusFailed: tcell.ColorRed,
-	codepipeline.StageExecutionStatusCancelled: tcell.ColorSlateGray,
-	codepipeline.StageExecutionStatusStopped: tcell.ColorBrown,
-	codepipeline.StageExecutionStatusStopping: tcell.ColorSandyBrown,
+var statusColors = map[string]string{
+	codepipeline.StageExecutionStatusSucceeded:  "green",
+	codepipeline.StageExecutionStatusInProgress: "blue",
+	codepipeline.StageExecutionStatusFailed:     "red",
+	codepipeline.StageExecutionStatusCancelled:  "gray",
+	codepipeline.StageExecutionStatusStopped:    "brown",
+	codepipeline.StageExecutionStatusStopping:   "cyan",
 }
 
-func (app *lspipeline) renderPipelineStage(now *time.Time, top int, state *codepipeline.StageState) {
-	latestExecution := state.ActionStates[0].LatestExecution
-	executionStatus := *latestExecution.Status
-	color := statusColors[executionStatus]
+const (
+	styleBold = "b"
+	styleBlink = "l"
+	styleDim = "d"
+	styleReverse = "r"
+	styleUnderline = "u"
+	styleReset = "-"
+)
 
-	lines := []string{
-		*state.StageName,
-		executionStatus,
-		prettyPrintTime(now, latestExecution.LastStatusChange),
-	}
-
-	var longestLine int
-	for _, line := range lines {
-		if len(line) > longestLine {
-			longestLine = len(line)
-		}
-	}
-
-	w, _ := app.s.Size()
-	left := (w - longestLine) / 2
-	app.renderMessageBox(
-		lines,
-		left,
-		top,
-		tcell.StyleDefault.Foreground(color))
+func tviewStyle(fg, bg string, style ...string) string {
+	return fmt.Sprintf("[%s:%s:%s]", fg, bg, strings.Join(style, ""))
 }
 
-func (app *lspipeline) renderPipeline(pipelineName string) {
-	pipelineState, err := app.client.GetPipelineState(&codepipeline.GetPipelineStateInput{
-		Name: aws.String(pipelineName),
-	})
-	if err != nil {
-		panic(err)
-	}
-
-	startTop := 1
-	now := time.Now()
-	for i, state := range pipelineState.StageStates {
-		app.renderPipelineStage(&now, startTop + i*5, state)
-	}
-
-	_, h := app.s.Size()
-	app.emitStr(0, h-1, tcell.StyleDefault, fmt.Sprintf("last updated %s", now.Format(dateFormat)))
-
-	app.s.Show()
-}
-
-func (app *lspipeline) renderPipelineLoop(pipelineName string) {
-	app.initScreen()
-
-	ticker := time.NewTicker(time.Second * refreshPeriod)
-	defer ticker.Stop()
-	quit := make(chan bool)
-
-	go func() {
-		for {
-			switch evt := app.s.PollEvent().(type) {
-			case *tcell.EventKey:
-				if evt.Key() == tcell.KeyEscape {
-					close(quit)
-					return
-				}
-			}
-		}
-	}()
-
-	app.renderPipeline(pipelineName)
-	for {
-		select {
-		case <- quit:
-			app.s.Fini()
-			return
-		case <- ticker.C:
-			app.renderPipeline(pipelineName)
-		}
-	}
-}
+var resetAllStyles = tviewStyle("-", "-", "-")
 
 // pretty print time `t` relative to `now`
 func prettyPrintTime(now, t *time.Time) string {
 	diff := now.Sub(*t)
 	minutes := int(diff.Minutes())
-	seconds := int(diff.Seconds())
+	seconds := int(diff.Seconds()) % 60
 
 	if minutes >= 30 {
 		return t.In(time.Local).Format(dateFormat)
@@ -164,6 +144,12 @@ func prettyPrintTime(now, t *time.Time) string {
 	} else {
 		return fmt.Sprintf("%d seconds ago", int(diff.Seconds()))
 	}
+}
+
+func prettyPrintStatus(status *string) string {
+	color := statusColors[*status]
+	style := tviewStyle(color, "-", styleBold)
+	return strings.Join([]string{style, *status, resetAllStyles}, "")
 }
 
 func (app *lspipeline) Run() {
@@ -183,82 +169,15 @@ func (app *lspipeline) Run() {
 	}
 
 	pipelineName := os.Args[1]
-	app.renderPipelineLoop(pipelineName)
-}
 
-// Taken from https://github.com/gdamore/tcell/blob/master/_demos/hello_world.go
-func (app *lspipeline) emitStr(x, y int, style tcell.Style, str string) {
-	for _, c := range str {
-		var comb []rune
-		w := runewidth.RuneWidth(c)
-		if w == 0 {
-			comb = []rune{c}
-			c = ' '
-			w = 1
-		}
-		app.s.SetContent(x, y, c, comb, style)
-		x += w
+	if app.flex == nil {
+		app.flex = tview.NewFlex().SetDirection(tview.FlexRow)
+		app.SetRoot(app.flex, true)
 	}
-}
-
-const (
-	tl = "╔"
-	tr = "╗"
-	vt = "║"
-	hz = "═"
-	bl = "╚"
-	br = "╝"
-)
-
-func (app *lspipeline) renderMessageBox(lines []string, boxLeft, boxTop int, style tcell.Style) {
-	// Figure out how to draw a box around "message"
-	var boxWidth int
-	boxSidePadding := 4  // 2 x (1 space on side, plus 1 for border)
-	for _, line := range lines {
-		if len(line) > boxWidth - boxSidePadding {
-			boxWidth = len(line) + boxSidePadding
-		}
+	go app.renderPipeline(pipelineName)
+	if err := app.Application.Run(); err != nil {
+		panic(err)
 	}
-
-	// Construct top border
-	var topBorder strings.Builder
-	topBorder.WriteString(tl)
-	for i := 0; i < boxWidth-2; i++ {
-		topBorder.WriteString(hz)
-	}
-	topBorder.WriteString(tr)
-
-	// Construct bottom border
-	var bottomBorder strings.Builder
-	bottomBorder.WriteString(bl)
-	for i := 0; i < boxWidth-2; i++ {
-		bottomBorder.WriteString(hz)
-	}
-	bottomBorder.WriteString(br)
-
-	// Construct message lines (goes in the middle)
-	var renderLines []string
-	for _, line := range lines {
-		var lineBuilder strings.Builder
-		leftSpacePad := (boxWidth - len(line) - boxSidePadding) / 2 + 1
-		rightSpacePad := boxWidth - len(line) - leftSpacePad - 2
-		lineBuilder.WriteString(vt)
-		for i := 0; i < leftSpacePad; i++ {
-			lineBuilder.WriteString(" ")
-		}
-		lineBuilder.WriteString(line)
-		for i := 0; i < rightSpacePad; i++ {
-			lineBuilder.WriteString(" ")
-		}
-		lineBuilder.WriteString(vt)
-		renderLines = append(renderLines, lineBuilder.String())
-	}
-
-	app.emitStr(boxLeft, boxTop, style, topBorder.String())
-	for i, line := range renderLines {
-		app.emitStr(boxLeft, boxTop+i+1, style, line)
-	}
-	app.emitStr(boxLeft, boxTop+len(renderLines)+1, style, bottomBorder.String())
 }
 
 func main() {
