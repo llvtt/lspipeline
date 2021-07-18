@@ -72,18 +72,23 @@ func (app *lspipeline) renderPipelineActionState(rowFlex *tview.Flex, now *time.
 	view.SetTitle(*state.ActionName).SetBorder(true)
 	rowFlex.AddItem(view, 0, 1, false)
 
-	_, _, width, _ := view.GetInnerRect()
+	_, _, width, _ := app.flex.GetInnerRect()
 	compact := width < 30
 
+	latestExecution := state.LatestExecution
 	var text strings.Builder
-	text.WriteString("Last Status Change: ")
-	if compact {
+	if latestExecution == nil {
+		text.WriteString("no latest execution")
+	} else {
+		text.WriteString("Last Status Change: ")
+		if compact {
+			text.WriteString("\n")
+		}
+		text.WriteString(prettyPrintTime(now, state.LatestExecution.LastStatusChange))
 		text.WriteString("\n")
+		text.WriteString("Status: ")
+		text.WriteString(prettyPrintStatus(state.LatestExecution.Status))
 	}
-	text.WriteString(prettyPrintTime(now, state.LatestExecution.LastStatusChange))
-	text.WriteString("\n")
-	text.WriteString("Status: ")
-	text.WriteString(prettyPrintStatus(state.LatestExecution.Status))
 
 	_, err := view.Write([]byte(text.String()))
 	if err != nil {
